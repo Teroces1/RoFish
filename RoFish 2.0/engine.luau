@@ -14,6 +14,9 @@ engine.__index = engine
 
 ]]
 
+
+local MAX_DEPTH = 128
+
 local PieceValues = {
 	[1] = 200,
 	[2] = 300,
@@ -191,8 +194,15 @@ function engine.new()
 	
 	self.killerMoves = {}
 	
+	self.moveBuffer = {}
+	self.scoreBuffer = {}
+	for i = 1, 128 do
+		self.moveBuffer[i] = table.create(218, nil)	-- 218 total possible moves in a legal chess position
+		self.scoreBuffer[i] = table.create(218, 0)
+	end
+	
 	self:initializeZobristKeys()
-	self:initializeTranspositionTable(1*256*4096)
+	self:initializeTranspositionTable(20)
 	
 	
 	self.bestLine = table.create(100,0)
@@ -433,6 +443,8 @@ end
 
 @native
 function engine:_getLegalMoves(noSort, ply, onlyCaptures)
+	ply = ply or 0
+	
 	local lightKing = self.lightKing
 	local darkKing = self.darkKing
 	
@@ -817,8 +829,8 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 
 
 	local totalMoves = 0
-	local results = table.create(60,0)
-	local moveScores = table.create(60,0)
+	local results = self.moveBuffer[ply+1]
+	local moveScores = self.scoreBuffer[ply+1]
 	
 	if incheck == false then
 		if sideToMove == 0 and myKing == 61 then -- blacks turn to move and king is on home square
@@ -1016,7 +1028,7 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 	
 	
 	if noSort then
-		return results, totalMoves, incheck
+		return totalMoves, incheck
 	end
 	
 	for pass = 1, totalMoves - 1 do
@@ -1036,7 +1048,7 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 	-- the sort does not even have to finish, making selection sort faster.
 	
 	
-	return results, totalMoves, incheck
+	return totalMoves, incheck
 end
 
 @native
@@ -1266,32 +1278,47 @@ function engine:unmakeMove()
 end
 
 @native
-function engine:perft(depth)
-	if depth == 0 then return 1 end
-	local legalMoves, numMoves, inCheck = self:_getLegalMoves(true)
-	
-	
+function engine:perft(depth, ply)
 
-	if #legalMoves == 0 and inCheck then
-		self.checkmates += 1
+	if depth == 0 then
 		return 1
 	end
-	
-	if self.nextBreakTime > 0 and self.nextBreakTime <= os.clock() then
-		task.wait(0.1)
-		self.nextBreakTime = os.clock()+2
+
+	local key = self.hash
+	--if depth >= 2 then			-- [perf]: depth >= 1 or 2 doesnt matter much
+		local cached = self:TTlookupPerft(key, depth)
+		if cached then
+			return cached
+		end
+	--end
+
+	local numMoves, inCheck = self:_getLegalMoves(true, ply, false)
+
+	if numMoves == 0 then
+		if inCheck then
+			self.checkmates += 1
+		end
+		return 0
+	end
+
+	if depth == 1 then
+		return numMoves
 	end
 
 	local totalSum = 0
 
-	for i,v in legalMoves do
+	for i,v in self.moveBuffer[ply+1] do
 		if i > numMoves then break end
 
 		self:makeMove(v)
-		totalSum += self:perft(depth-1)
+		totalSum += self:perft(depth-1, ply+1)
 		self:unmakeMove()
 	end
 	
+	--if depth >= 2 then
+		self:TTstorePerft(key, depth, totalSum)
+	--end
+
 	return totalSum
 end
 
@@ -1316,7 +1343,9 @@ function engine:str2move(str)
 	if fromFile and fromRank and toFile and toRank then
 		local move = Vector3.new((fromRank-1)*8 + fromFile + 1, (toRank-1)*8 + toFile + 1)
 		
-		local moves, numMoves, _ = self:_getLegalMoves(true)
+		local numMoves, _ = self:_getLegalMoves(true, 0, false)
+		print(self.moveBuffer)
+		local moves = self.moveBuffer[1]
 		for i = 1, numMoves do
 			if moves[i].X == move.X and moves[i].Y == move.Y then
 				if moves[i].Z <= 1 or moves[i].Z > 8 then
@@ -1328,7 +1357,7 @@ function engine:str2move(str)
 				end
 			end
 		end
-		error("Move does not exist")
+		error(`Move does not exist ({move.X} {move.Y}; {move.Z})`)
 	else
 		error("Invalid notation")
 	end
@@ -1389,9 +1418,12 @@ function engine:generateZobristHash()
 	end
 end
 
-function engine:initializeTranspositionTable(size)
+function engine:initializeTranspositionTable(sizeBits)
+	local size = 2^sizeBits
 	self.TT = table.create(size, 0)
 	self.TTSize = size
+	self.TTSizeBits = sizeBits
+	self.TTIndexMask = 2^self.TTSizeBits - 1
 	
 	warn("Creating transposition table of with ".. formatNumber(size).." entries!")
 	
@@ -1408,7 +1440,7 @@ local TT_UPPER_BOUND = 1
 local TT_LOOKUP_FAILED = math.huge
 
 function engine:TTstoreEvaluation(key, eval, matePly, move, depth, nodeType)
-	local entry = self.TT[key%self.TTSize + 1]
+	local entry = self.TT[bit32.band(key, self.TTIndexMask) + 1]
 	entry[1] = key
 	entry[2] = eval
 	entry[3] = matePly
@@ -1418,11 +1450,11 @@ function engine:TTstoreEvaluation(key, eval, matePly, move, depth, nodeType)
 end
 
 function engine:TTget(key)
-	return self.TT[key%self.TTSize + 1]
+	return self.TT[bit32.band(key, self.TTIndexMask) + 1]
 end
 
 function engine:TTgetMove(key)
-	return self.TT[key%self.TTSize + 1][4]
+	return self.TT[bit32.band(key, self.TTIndexMask) + 1][4]
 end
 
 function engine:TTclear()
@@ -1437,7 +1469,7 @@ function engine:TTclear()
 end
 
 function engine:TTlookupEval(key, depth, ply, alpha, beta)
-	local entry = self.TT[key%self.TTSize + 1]
+	local entry = self.TT[bit32.band(key, self.TTIndexMask) + 1]
 
 	if entry[1] == key and entry[5] >= depth then
 		if entry[6] == 0 then	-- exact
@@ -1452,6 +1484,25 @@ function engine:TTlookupEval(key, depth, ply, alpha, beta)
 	end
 
 	return TT_LOOKUP_FAILED
+end
+
+
+function engine:TTlookupPerft(key, depth)
+	local entry = self.TT[bit32.band(key, self.TTIndexMask) + 1]
+
+	if entry[1] == key and entry[5] == depth then
+		return entry[2]
+	end
+
+	return nil
+end
+
+function engine:TTstorePerft(key, depth, nodes)
+	local entry = self.TT[bit32.band(key, self.TTIndexMask) + 1]
+
+	entry[1] = key
+	entry[2] = nodes
+	entry[5] = depth
 end
 
 
@@ -1739,7 +1790,7 @@ function engine:search(depth, alpha, beta, startTime, timeLimit, ply)
 	end
 
 	--##############################################################################################################
-	local legalMoves, numMoves, inCheck = self:_getLegalMoves(false, ply, false)
+	local numMoves, inCheck = self:_getLegalMoves(false, ply, false)
 	-- If no legal moves, return evaluation (could be mate/stalemate handling)
 	if numMoves == 0 then
 		if inCheck then return -20000 + ply, ply else return 0, -1 end
@@ -1750,7 +1801,7 @@ function engine:search(depth, alpha, beta, startTime, timeLimit, ply)
 	local evalType = TT_UPPER_BOUND
 	local bestMove = nil
 
-	for i, move in ipairs(legalMoves) do
+	for i, move in ipairs(self.moveBuffer[ply+1]) do
 		if i > numMoves then break end
 		self:makeMove(move)
 		local score, mate = self:search(depth - 1, -beta, -alpha, startTime, timeLimit, ply+1)
@@ -1841,8 +1892,8 @@ function engine:quiescence(alpha, beta, startTime, timeLimit, ply)
 	
 	local matePly = -1
 
-	local captureMoves, numMoves, inCheck = self:_getLegalMoves(false, ply, true)
-	for i, move in ipairs(captureMoves) do
+	local numMoves, inCheck = self:_getLegalMoves(false, ply, true)
+	for i, move in ipairs(self.moveBuffer[ply+1]) do
 		if i > numMoves then break end
 		self:makeMove(move)
 		local score, mate = self:quiescence(-beta, -alpha, startTime, timeLimit, ply+1)
@@ -1887,13 +1938,13 @@ function engine:_go_search(depth, startTime, timeLimit)
 	return self:search(depth, -99999, 99999, startTime, timeLimit, 0)
 	
 	
-	--local legalMoves, numMoves, inCheck = self:_getLegalMoves(asdf)
+	--local numMoves, inCheck = self:_getLegalMoves(asdf)
 	--local bestScore = -99999
 	--local bestMove = nil
 	--local alpha = -99999
 	--local beta = 99999
 
-	--for i, move in ipairs(legalMoves) do
+	--for i, move in ipairs(self.moveBuffer[ply+1]) do
 	--	if os.clock() - startTime >= timeLimit then
 	--		self.stopSearch = true
 	--		break
@@ -1988,8 +2039,8 @@ function engine:log()
 end
 
 function engine:getLegalMoves()
-	local moves, num = self:_getLegalMoves(true, 0, false)
-	moves = table.move(moves,1,num,1,{})
+	local num = self:_getLegalMoves(true, 0, false)
+	local moves = table.move(self.moveBuffer[1],1,num,1,{})
 	return moves
 end
 
@@ -2006,7 +2057,7 @@ function engine:go_infiniteSearch(updateCallback: ()->({
 	transpositions: number,
 	evaluations: number,
 	num_pruned: number,
-	best_move: bestMove,
+	best_move: Vector3,
 	evaluation: number,
 	mate_ply: number,
 	compute_time: number
@@ -2093,7 +2144,7 @@ function engine:go_perft(depth, expectedDebug)
 	
 	local start = os.clock()
 	
-	local legalMoves, numMoves, inCheck = self:_getLegalMoves(true)
+	local numMoves, inCheck = self:_getLegalMoves(true, 0, false)
 	local totalSum = 0
 	
 
@@ -2106,11 +2157,11 @@ function engine:go_perft(depth, expectedDebug)
 		end
 	else
 		
-		for i,v in legalMoves do
+		for i,v in self.moveBuffer[1] do
 			if i > numMoves then break end
 			
 			self:makeMove(v)
-			local num = self:perft(depth-1)
+			local num = self:perft(depth-1, 1)
 			totalSum += num
 			self:unmakeMove()
 			
@@ -2120,6 +2171,7 @@ function engine:go_perft(depth, expectedDebug)
 				str ..= " : [SHOULD BE "..expectedDebug[movestr].."]"
 			end
 			print(str)
+			task.wait()
 		end
 	end
 	
