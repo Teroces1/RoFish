@@ -201,6 +201,9 @@ function engine.new()
 		self.moveBuffer[i] = table.create(218, nil)	-- 218 total possible moves in a legal chess position
 		self.scoreBuffer[i] = table.create(218, 0)
 	end
+	
+	self.generatedMovesBufferL = table.create(64, 0)
+	self.generatedMovesBufferU = table.create(64, 0)
 
 	self:initializeZobristKeys()
 	self:initializeTranspositionTable(20)
@@ -403,12 +406,13 @@ function engine:getFEN()
 end
 
 @native
-function engine:convertMovesFromBitboard(moves, pos, lower, upper, isApawn)
+function engine:convertMovesFromBitboard____UNUSED_TODO(moves, pos, lower, upper, isApawn)
 	local c = 0
 	while lower > 0 do
 		local newC = bit32.countrz(lower)+1
 		c+=newC
 		-- V3 (start, end, special id)
+		local move = pos + c * 64			-- native: on 100M iterations, multiplication was 2 ms faster than bit32.lshift (like a few percent time difference)
 		if isApawn and c == self.enPassantTarget then
 			table.insert(moves, Vector3.new(pos, c,1))
 		elseif isApawn and c < 9 then
@@ -485,14 +489,20 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 
 	local piecesNoMyKingL, piecesNoMyKingU = bit32.band(piecesL, bit32.bnot(myKingBBL)), bit32.band(piecesU, bit32.bnot(myKingBBU))
 
-	local pieceMovesLower,pieceMovesUpper
+	local pieceMovesLower,pieceMovesUpper = self.generatedMovesBufferL, self.generatedMovesBufferU
 
 	if onlyCaptures then
-		pieceMovesLower = table.create(64, enemyL)
-		pieceMovesUpper = table.create(64, enemyU)
+		for i = 1, 64 do
+			pieceMovesLower[i] = enemyL
+			pieceMovesUpper[i] = enemyU
+		end
 	else
-		pieceMovesLower= table.create(64, bit32.bnot(mySideL))
-		pieceMovesUpper = table.create(64, bit32.bnot(mySideU))
+		local tempL = bit32.bnot(mySideL)
+		local tempU = bit32.bnot(mySideU)
+		for i = 1, 64 do
+			pieceMovesLower[i] = tempL
+			pieceMovesUpper[i] = tempU
+		end
 	end
 
 	local enemyAttacksL, enemyAttacksU = 0,0
@@ -524,7 +534,7 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 
 	local pawnAttacksL, pawnAttacksU = 0,0
 
-	for pos, fullPiece in ipairs(self.board) do
+	for pos, fullPiece in self.board do	-- native: iterating over a table directly is actually a few percent faster than using ipairs (which is just a little faster than pairs)
 		if fullPiece == 0 then continue end
 
 		local posBbL = bit32.lshift(1, pos-1)
@@ -841,11 +851,11 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 			-- adding the castling moves and clearing the castling moves from the king moves
 			if bit32.band(kingMovesU, 201326592) == 201326592 and not bit32.btest(piecesU,234881024) then
 				totalMoves += 1
-				results[totalMoves] = Vector3.new(61, 59, 11)
+				results[totalMoves] = 48828 -- Vector3.new(61, 59, 11)
 			end
 			if bit32.band(kingMovesU, 1610612736) == 1610612736 and not bit32.btest(piecesU,1610612736) then
 				totalMoves += 1
-				results[totalMoves] = Vector3.new(61, 63, 12)
+				results[totalMoves] = 53180 -- Vector3.new(61, 63, 12)
 			end
 		elseif sideToMove ~= 0 and myKing == 5 then	-- whites turn to move and king is on home square
 			-- applying castling rights mask
@@ -854,11 +864,11 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 			-- adding the castling moves and clearing the castling moves from the king moves
 			if bit32.band(kingMovesL, 12) == 12 and not bit32.btest(piecesL,14) then
 				totalMoves += 1
-				results[totalMoves] = Vector3.new(5, 3, 11)
+				results[totalMoves] = 45188 -- Vector3.new(5, 3, 11)
 			end
 			if bit32.band(kingMovesL, 96) == 96 and not bit32.btest(piecesL,96) then
 				totalMoves += 1
-				results[totalMoves] = Vector3.new(5, 7, 12)
+				results[totalMoves] = 49540 -- Vector3.new(5, 7, 12)
 			end
 		end
 		if myKing == 5 then
@@ -898,12 +908,17 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 			end
 
 			local ispawn = piece == 3
+			
 
 			local c = 0
 			while bbl > 0 do
-				local newC = bit32.countrz(bbl)+1
-				c+=newC
-				bbl = bit32.rshift(bbl, newC)
+				-- slower: 
+				--local newC = bit32.countrz(bbl)+1
+				--c+=newC
+				--bbl = bit32.rshift(bbl, newC)
+				
+				c = bit32.countrz(bbl) + 1
+				bbl = bit32.band(bbl, bbl - 1) -- automatically clears lowest set bit!!! brilliant!!!
 
 				if onlyCaptures and self.board[c] == 0 then continue end
 
@@ -918,36 +933,38 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 
 				score += piecePositionBonuses[piece][c] - piecePositionBonuses[piece][pos]	-- TODO: maybe add this back later?
 
+				local move = pos + c*64 - 65
 
 				if ispawn and c <= 8 then
 					totalMoves += 4
 
-					results[totalMoves] = Vector3.new(pos, c, 2)
+
+					results[totalMoves] = move + 8192 -- Vector3.new(pos, c, 2)
 					moveScores[totalMoves] = score + 300
-					results[totalMoves-1] = Vector3.new(pos, c, 5)
+					results[totalMoves-1] = move + 20480 -- Vector3.new(pos, c, 5)
 					moveScores[totalMoves-1] = score + 500
-					results[totalMoves-2] = Vector3.new(pos, c, 6)
+					results[totalMoves-2] = move + 24576 -- Vector3.new(pos, c, 6)
 					moveScores[totalMoves-2] = score + 320
-					results[totalMoves-3] = Vector3.new(pos, c, 7)
+					results[totalMoves-3] = move + 28672 -- Vector3.new(pos, c, 7)
 					moveScores[totalMoves-3] = score + 900
 
-					if results[totalMoves-1] == hashedMove then	-- prob gonna be a good move: should search this first
-						moveScores[totalMoves-1] += 100000
+					if results[totalMoves-3] == hashedMove then	-- prob gonna be a good move: should search this first
+						moveScores[totalMoves-3] += 100000
 					elseif results[totalMoves-2] == hashedMove then	-- prob gonna be a good move: should search this first
 						moveScores[totalMoves-2] += 100000
-					elseif results[totalMoves-3] == hashedMove then	-- prob gonna be a good move: should search this first
-						moveScores[totalMoves-3] += 100000
+					elseif results[totalMoves-1] == hashedMove then	-- prob gonna be a good move: should search this first
+						moveScores[totalMoves-1] += 100000
 					end
 				elseif ispawn and c == enPassantTarget then
 					if enPassantAllowed then
 						totalMoves += 1
-						results[totalMoves] = Vector3.new(pos, c, 1)
+						results[totalMoves] = move + 4096 -- Vector3.new(pos, c, 1)
 						moveScores[totalMoves] = score
 					end
 					-- if en passant isnt allowed, trash this move
 				else
 					totalMoves += 1
-					results[totalMoves] = Vector3.new(pos, c)
+					results[totalMoves] = move -- Vector3.new(pos, c)
 					moveScores[totalMoves] = score
 				end
 
@@ -964,9 +981,11 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 
 			c = 32
 			while bbu > 0 do
-				local newC = bit32.countrz(bbu)+1
-				c+=newC
-				bbu = bit32.rshift(bbu, newC)
+				--local newC = bit32.countrz(bbu)+1
+				--c+=newC
+				--bbu = bit32.rshift(bbu, newC)
+				c = bit32.countrz(bbu) + 33
+				bbu = bit32.band(bbu, bbu - 1) -- automatically clears lowest set bit!!! brilliant!!!
 
 				if onlyCaptures and self.board[c] == 0 then continue end
 
@@ -981,35 +1000,38 @@ function engine:_getLegalMoves(noSort, ply, onlyCaptures)
 
 				score += piecePositionBonuses[piece][c] - piecePositionBonuses[piece][pos]	-- TODO: maybe add this back later?
 
+				local move = pos + c*64 - 65
+
 				if ispawn and c > 56 then
 					totalMoves += 4
 
-					results[totalMoves] = Vector3.new(pos, c, 2)
+
+					results[totalMoves] = move + 8192 -- Vector3.new(pos, c, 2)
 					moveScores[totalMoves] = score + 300
-					results[totalMoves-1] = Vector3.new(pos, c, 5)
+					results[totalMoves-1] = move + 20480 -- Vector3.new(pos, c, 5)
 					moveScores[totalMoves-1] = score + 500
-					results[totalMoves-2] = Vector3.new(pos, c, 6)
+					results[totalMoves-2] = move + 24576 -- Vector3.new(pos, c, 6)
 					moveScores[totalMoves-2] = score + 320
-					results[totalMoves-3] = Vector3.new(pos, c, 7)
+					results[totalMoves-3] = move + 28672 -- Vector3.new(pos, c, 7)
 					moveScores[totalMoves-3] = score + 900
 
-					if results[totalMoves-1] == hashedMove then	-- prob gonna be a good move: should search this first
-						moveScores[totalMoves-1] += 100000
+					if results[totalMoves-3] == hashedMove then	-- prob gonna be a good move: should search this first
+						moveScores[totalMoves-3] += 100000
 					elseif results[totalMoves-2] == hashedMove then	-- prob gonna be a good move: should search this first
 						moveScores[totalMoves-2] += 100000
-					elseif results[totalMoves-3] == hashedMove then	-- prob gonna be a good move: should search this first
-						moveScores[totalMoves-3] += 100000
+					elseif results[totalMoves-1] == hashedMove then	-- prob gonna be a good move: should search this first
+						moveScores[totalMoves-1] += 100000
 					end
 				elseif ispawn and c == enPassantTarget then
 					if enPassantAllowed then
 						totalMoves += 1
-						results[totalMoves] = Vector3.new(pos, c, 1)
+						results[totalMoves] = move + 4096 -- Vector3.new(pos, c, 1)
 						moveScores[totalMoves] = score
 					end
 					-- if en passant isnt allowed, trash this move
 				else
 					totalMoves += 1
-					results[totalMoves] = Vector3.new(pos, c)
+					results[totalMoves] = move -- Vector3.new(pos, c)
 					moveScores[totalMoves] = score
 				end
 
@@ -1054,10 +1076,14 @@ end
 
 @native
 function engine:makeMove(move)
-	local piece = self.board[move.X]
+	local moveFrom = bit32.band(move, 0x3F) + 1	-- first 6 bits
+	local moveTo = bit32.band(move, 0xFC0) / 64 + 1 -- next 6 bits -- native: division is just like 1.24% faster than bit32.rshift(move, 6), and both faster than using //
+	local moveSpecial = bit32.band(move, 0xF000) / 4096 -- final 4 bits -- native: division is faster than both methods ^^^
+	
+	local piece = self.board[moveFrom]
 	local i = self.totalMoves * 11
 	self.moveLog[i  ] = move
-	self.moveLog[i+1] = self.board[move.Y]
+	self.moveLog[i+1] = self.board[moveTo]
 	self.moveLog[i+2] = self.castlingRights
 	self.moveLog[i+3] = self.enPassantTarget
 	self.moveLog[i+4] = self.halfTimeClock
@@ -1071,19 +1097,19 @@ function engine:makeMove(move)
 	--self.moveLog[self.totalMoves] = {move, self.board[move.Y], self.castlingRights, self.enPassantTarget, self.halfTimeClock, self.darkL, self.darkU, self.lightL, self.lightU, self.hash}
 
 
-	if self.board[move.Y] > 0 then
-		self.hashL = bit32.bxor(self.hashL,self.pieceZobristKeysL[move.Y][self.board[move.Y]], self.pieceZobristKeysL[move.X][piece], self.pieceZobristKeysL[move.Y][piece], self.sideToMoveZobristKeyL)
-		self.hashU = bit32.bxor(self.hashU,self.pieceZobristKeysU[move.Y][self.board[move.Y]], self.pieceZobristKeysU[move.X][piece], self.pieceZobristKeysU[move.Y][piece], self.sideToMoveZobristKeyU)
+	if self.board[moveTo] > 0 then
+		self.hashL = bit32.bxor(self.hashL,self.pieceZobristKeysL[moveTo][self.board[moveTo]], self.pieceZobristKeysL[moveFrom][piece], self.pieceZobristKeysL[moveTo][piece], self.sideToMoveZobristKeyL)
+		self.hashU = bit32.bxor(self.hashU,self.pieceZobristKeysU[moveTo][self.board[moveTo]], self.pieceZobristKeysU[moveFrom][piece], self.pieceZobristKeysU[moveTo][piece], self.sideToMoveZobristKeyU)
 	else
-		self.hashL = bit32.bxor(self.hashL,self.pieceZobristKeysL[move.X][piece], self.pieceZobristKeysL[move.Y][piece], self.sideToMoveZobristKeyL)
-		self.hashU = bit32.bxor(self.hashU,self.pieceZobristKeysU[move.X][piece], self.pieceZobristKeysU[move.Y][piece], self.sideToMoveZobristKeyU)
+		self.hashL = bit32.bxor(self.hashL,self.pieceZobristKeysL[moveFrom][piece], self.pieceZobristKeysL[moveTo][piece], self.sideToMoveZobristKeyL)
+		self.hashU = bit32.bxor(self.hashU,self.pieceZobristKeysU[moveFrom][piece], self.pieceZobristKeysU[moveTo][piece], self.sideToMoveZobristKeyU)
 	end
 
-	self.board[move.Y] = piece
-	self.board[move.X] = 0
+	self.board[moveTo] = piece
+	self.board[moveFrom] = 0
 
 
-	local toL, toU, fromL, fromU = bit32.lshift(1, move.Y-1), bit32.lshift(1, move.Y-33), bit32.lshift(1, move.X-1), bit32.lshift(1, move.X-33)
+	local toL, toU, fromL, fromU = bit32.lshift(1, moveTo-1), bit32.lshift(1, moveTo-33), bit32.lshift(1, moveFrom-1), bit32.lshift(1, moveFrom-33)
 
 	if self.sideToMove == 0 then
 		self.darkL = bit32.bor(bit32.band(self.darkL, bit32.bnot(fromL)), toL)
@@ -1106,42 +1132,42 @@ function engine:makeMove(move)
 	self.enPassantTarget = 0
 
 
-	if move.Z == 0 then			-- normal move
+	if moveSpecial == 0 then			-- normal move
 		if piece == 3 then
-			if move.X - move.Y == 16 then
-				self.enPassantTarget = move.X - 8
+			if moveFrom - moveTo == 16 then
+				self.enPassantTarget = moveFrom - 8
 				self.hashL = bit32.bxor(self.hashL, self.enPassantZobristKeysL[65], self.enPassantZobristKeysL[self.enPassantTarget])
 				self.hashU = bit32.bxor(self.hashU, self.enPassantZobristKeysU[65], self.enPassantZobristKeysU[self.enPassantTarget])
 			end
 			self.halfTimeClock = 0
 		elseif piece == 11 then
-			if move.Y - move.X == 16 then
-				self.enPassantTarget = move.X + 8
+			if moveTo - moveFrom == 16 then
+				self.enPassantTarget = moveFrom + 8
 				self.hashL = bit32.bxor(self.hashL, self.enPassantZobristKeysL[65], self.enPassantZobristKeysL[self.enPassantTarget])
 				self.hashU = bit32.bxor(self.hashU, self.enPassantZobristKeysU[65], self.enPassantZobristKeysU[self.enPassantTarget])
 			end
 			self.halfTimeClock = 0
 		elseif piece == 1 then
-			self.darkKing = move.Y
+			self.darkKing = moveTo
 			self.halfTimeClock = 0
 		elseif piece == 9 then
-			self.lightKing = move.Y
+			self.lightKing = moveTo
 			self.halfTimeClock = 0
 		end
-	elseif move.Z == 1 then		-- en passant
+	elseif moveSpecial == 1 then		-- en passant
 		if piece == 3 then
 			self.lightL = bit32.band(self.lightL, bit32.bnot(bit32.lshift(toL,8)))	-- native: bitshifting is slightly faster than multiplying by 256
-			self.board[move.Y + 8] = 0
-			self.hashL = bit32.bxor(self.hashL, self.pieceZobristKeysL[move.Y + 8][11])
-			self.hashU = bit32.bxor(self.hashU, self.pieceZobristKeysU[move.Y + 8][11])
+			self.board[moveTo + 8] = 0
+			self.hashL = bit32.bxor(self.hashL, self.pieceZobristKeysL[moveTo + 8][11])
+			self.hashU = bit32.bxor(self.hashU, self.pieceZobristKeysU[moveTo + 8][11])
 		else
 			self.darkU = bit32.band(self.darkU, bit32.bnot(bit32.rshift(toU,8)))	-- native: bitshifting is slightly faster than multiplying by 256
-			self.board[move.Y - 8] = 0
-			self.hashL = bit32.bxor(self.hashL, self.pieceZobristKeysL[move.Y - 8][3])
-			self.hashU = bit32.bxor(self.hashU, self.pieceZobristKeysU[move.Y - 8][3])
+			self.board[moveTo - 8] = 0
+			self.hashL = bit32.bxor(self.hashL, self.pieceZobristKeysL[moveTo - 8][3])
+			self.hashU = bit32.bxor(self.hashU, self.pieceZobristKeysU[moveTo - 8][3])
 		end
 		self.halfTimeClock = 0
-	elseif move.Z == 11 then	-- castling queen side
+	elseif moveSpecial == 11 then	-- castling queen side
 		if piece == 1 then
 			--self.board[61] = 0
 			--self.board[59] = 1
@@ -1164,7 +1190,7 @@ function engine:makeMove(move)
 			self.hashU = bit32.bxor(self.hashU, self.pieceZobristKeysU[1][13], self.pieceZobristKeysU[4][13])
 		end
 		self.halfTimeClock = 0
-	elseif move.Z == 12 then	-- castling king side
+	elseif moveSpecial == 12 then	-- castling king side
 		if piece == 1 then
 			--self.board[61] = 0
 			--self.board[63] = 1
@@ -1188,15 +1214,15 @@ function engine:makeMove(move)
 		end
 		self.halfTimeClock = 0
 	else -- promotion
-		self.board[move.Y] = move.Z + self.sideToMove
+		self.board[moveTo] = moveSpecial + self.sideToMove
 		self.halfTimeClock = 0
-		self.hashL = bit32.bxor(self.hashL, self.pieceZobristKeysL[move.Y][piece], self.pieceZobristKeysL[move.Y][move.Z + self.sideToMove])
-		self.hashU = bit32.bxor(self.hashU, self.pieceZobristKeysU[move.Y][piece], self.pieceZobristKeysU[move.Y][move.Z + self.sideToMove])
+		self.hashL = bit32.bxor(self.hashL, self.pieceZobristKeysL[moveTo][piece], self.pieceZobristKeysL[moveTo][moveSpecial + self.sideToMove])
+		self.hashU = bit32.bxor(self.hashU, self.pieceZobristKeysU[moveTo][piece], self.pieceZobristKeysU[moveTo][moveSpecial + self.sideToMove])
 	end
 
 	local oldRights = self.castlingRights
 
-	self.castlingRights = bit32.band(self.castlingRights, moves.castlingRightsUpdater[move.X], moves.castlingRightsUpdater[move.Y])
+	self.castlingRights = bit32.band(self.castlingRights, moves.castlingRightsUpdater[moveFrom], moves.castlingRightsUpdater[moveTo])
 
 
 	if self.castlingRights ~= oldRights then
@@ -1207,12 +1233,15 @@ function engine:makeMove(move)
 	self.sideToMove = 8 - self.sideToMove
 	self.totalMoves += 1
 
-	self.positionHistory[Vector3.new(self.hashL, self.hashU)] = (self.positionHistory[Vector3.new(self.hashL, self.hashU)] or 0) + 1
+	self.positionHistory[self.hashL] = (self.positionHistory[self.hashL] or 0) + 1		-- using just 32 bit hashL should be enough, cause the posibility of 
 end
 
 @native
 function engine:unmakeMove()
-	self.positionHistory[Vector3.new(self.hashL, self.hashU)] -= 1
+	self.positionHistory[self.hashL] -= 1
+	if self.positionHistory[self.hashL] == 0 then
+		self.positionHistory[self.hashL] = nil
+	end
 
 	self.totalMoves -= 1
 	self.sideToMove = 8 - self.sideToMove
@@ -1234,25 +1263,29 @@ function engine:unmakeMove()
 
 	local piece = self.moveLog[i+1] --move[2]
 
-	local move = self.moveLog[i]
+	local move: number = self.moveLog[i]
 
-	self.board[move.X] = self.board[move.Y]
-	self.board[move.Y] = piece
+	local moveFrom = bit32.band(move, 0x3F) + 1	-- first 6 bits
+	local moveTo = bit32.band(move, 0xFC0) / 64 + 1 -- next 6 bits -- native: division is just like 1.24% faster than bit32.rshift(move, 6), and both faster than using //
+	local moveSpecial = bit32.band(move, 0xF000) / 4096 -- final 4 bits -- native: division is faster than both methods ^^^
 
-	piece = self.board[move.X]
-	if move.Z == 0 then
+	self.board[moveFrom] = self.board[moveTo]
+	self.board[moveTo] = piece
+
+	piece = self.board[moveFrom]
+	if moveSpecial == 0 then
 		if piece == 1 then
-			self.darkKing = move.X
+			self.darkKing = moveFrom
 		elseif piece == 9 then
-			self.lightKing = move.X
+			self.lightKing = moveFrom
 		end
-	elseif move.Z == 1 then
+	elseif moveSpecial == 1 then
 		if piece == 3 then
-			self.board[move.Y + 8] = 11
+			self.board[moveTo + 8] = 11
 		else
-			self.board[move.Y - 8] = 3
+			self.board[moveTo - 8] = 3
 		end
-	elseif move.Z == 11 then
+	elseif moveSpecial == 11 then
 		if piece == 1 then
 			--self.board[61] = 1
 			--self.board[59] = 0
@@ -1270,7 +1303,7 @@ function engine:unmakeMove()
 
 			self.lightKing = 5
 		end
-	elseif move.Z == 12 then
+	elseif moveSpecial == 12 then
 		if piece == 1 then
 			--self.board[61] = 1
 			--self.board[63] = 0
@@ -1289,7 +1322,7 @@ function engine:unmakeMove()
 			self.lightKing = 5
 		end
 	else
-		self.board[move.X] = 3 + self.sideToMove
+		self.board[moveFrom] = 3 + self.sideToMove
 	end
 end
 
@@ -1339,13 +1372,17 @@ function engine:perft(depth, ply)
 end
 
 function engine:move2str(move)
-	local fromFile, fromRank = (move.X-1) % 8, (move.X-1) // 8
-	local toFile, toRank = (move.Y-1) % 8, (move.Y-1) // 8
+	local moveFrom = bit32.band(move, 0x3F) + 1
+	local moveTo = bit32.band(move, 0xFC0) / 64 + 1
+	local moveSpecial = bit32.band(move, 0xF000) / 4096
+	
+	local fromFile, fromRank = (moveFrom-1) % 8, (moveFrom-1) // 8
+	local toFile, toRank = (moveTo-1) % 8, (moveTo-1) // 8
 
 	local str = string.char(97 + fromFile) .. (fromRank+1) .. string.char(97 + toFile) .. (toRank+1)
 
-	if move.Z > 1 and move.Z < 8 then
-		str..= ({"","n","","","r","b","q"})[move.Z]
+	if moveSpecial > 1 and moveSpecial < 8 then
+		str..= ({"","n","","","r","b","q"})[moveSpecial]
 	end
 
 	return str
@@ -1357,22 +1394,23 @@ function engine:str2move(str)
 	local toFile, toRank = b-97, tonumber(str:sub(4,4))
 
 	if fromFile and fromRank and toFile and toRank then
-		local move = Vector3.new((fromRank-1)*8 + fromFile + 1, (toRank-1)*8 + toFile + 1)
+		local move = ((fromRank-1)*8 + fromFile) + ((toRank-1)*8 + toFile)*64
 
 		local numMoves, _ = self:_getLegalMoves(true, 0, false)
-		local moves = self.moveBuffer[1]
+		local moves: {number} = self.moveBuffer[1]
 		for i = 1, numMoves do
-			if moves[i].X == move.X and moves[i].Y == move.Y then
-				if moves[i].Z <= 1 or moves[i].Z > 8 then
+			if bit32.band(moves[i], 4095) == move then
+				local moveSpecial = bit32.band(moves[i], 0xF000) / 4096
+				if moveSpecial <= 1 or moveSpecial > 8 then
 					return moves[i]
 				end
 
-				if ({"","n","","","r","b","q"})[moves[i].Z] == str:sub(5,5) then
+				if ({"","n","","","r","b","q"})[moveSpecial] == str:sub(5,5) then
 					return moves[i]
 				end
 			end
 		end
-		error(`Move does not exist ({move.X} {move.Y}; {move.Z})`)
+		error(`Move does not exist {str}`)
 	else
 		error("Invalid notation")
 	end
@@ -1708,7 +1746,7 @@ end
 function engine:evaluate()
 	self.cnt_eval += 1
 
-	if (self.positionHistory[Vector3.new(self.hashL, self.hashU)] or 0) >= 3 or self.halfTimeClock >= 50 then	-- TODO: find better way to index with has
+	if (self.positionHistory[self.hashL] or 0) >= 3 or self.halfTimeClock >= 50 then	-- TODO: find better way to index with has
 		return 0
 	end
 
@@ -1866,7 +1904,7 @@ function engine:search(depth, alpha, beta, startTime, timeLimit, ply)
 
 	--##############################################################################################################
 	-- check for draws here TODO: 3 fold repetition optimization
-	if (self.positionHistory[Vector3.new(self.hashL, self.hashU)] or 0) >= 3 or self.halfTimeClock >= 50 then		-- TODO: find better way to index with hash
+	if (self.positionHistory[self.hashL] or 0) >= 3 or self.halfTimeClock >= 50 then		-- TODO: find better way to index with hash
 		return 0, -1
 	end
 
@@ -1875,6 +1913,10 @@ function engine:search(depth, alpha, beta, startTime, timeLimit, ply)
 	local ttLookupEval, ttLookupCheckmatePly, ttLookupMove = self:TTlookupEval(self.hashL, self.hashU, depth, ply, alpha, beta)
 	if ttLookupEval ~= TT_LOOKUP_FAILED then
 		self.cnt_trans += 1
+		
+		-- fix chechmate evaluation
+		if ttLookupEval > 10000 then ttLookupEval = ttLookupEval - ply end
+		if ttLookupEval < -10000 then ttLookupEval = ttLookupEval + ply end
 		return ttLookupEval, ttLookupCheckmatePly, ttLookupMove
 	end
 
@@ -1905,8 +1947,7 @@ function engine:search(depth, alpha, beta, startTime, timeLimit, ply)
 		score = -score
 
 		if score >= beta then
-
-			if self.board[move.Y] == 0 then -- if the move is a non capture (if target square has no piece on it)
+			if self.board[bit32.band(move, 0xFC0) / 64 + 1] == 0 then -- if the move is a non capture (if target square has no piece on it)
 				local km1 = self.killerMoves[2*ply + 1]
 				local km2 = self.killerMoves[2*ply + 2]
 				if move ~= km1 and move ~= km2 then	-- if the move isnt already in the killer moves list
@@ -1916,7 +1957,13 @@ function engine:search(depth, alpha, beta, startTime, timeLimit, ply)
 			end
 
 			self.cnt_pruned += 1
-			self:TTstoreEvaluation(self.hashL, self.hashU, beta, mate, move, depth, TT_LOWER_BOUND)
+			
+
+			local storeScore = beta
+			if storeScore > 10000 then storeScore = storeScore + ply end
+			if storeScore < -10000 then storeScore = storeScore - ply end
+			
+			self:TTstoreEvaluation(self.hashL, self.hashU, storeScore, mate, move, depth, TT_LOWER_BOUND)
 			return beta, matePly  -- Beta cutoff
 		end
 
@@ -1951,11 +1998,11 @@ function engine:search(depth, alpha, beta, startTime, timeLimit, ply)
 		end
 	end
 
-	if ply == 0 then
-		--print("storing best move with hash\n"..self.hash.."\n: ", bestMove)
-	end
-
-	self:TTstoreEvaluation(self.hashL, self.hashU,alpha,matePly, bestMove, depth, evalType)
+	local storeScore = alpha
+	if storeScore > 10000 then storeScore = storeScore + ply end
+	if storeScore < -10000 then storeScore = storeScore - ply end
+	
+	self:TTstoreEvaluation(self.hashL, self.hashU,storeScore, matePly, bestMove, depth, evalType)
 
 	if ply == 0 then return alpha, matePly, bestMove end
 
@@ -2236,6 +2283,8 @@ function engine:go_perft(depth, expectedDebug)
 	assert(depth > 0)
 
 	self.checkmates = 0
+	
+	local output = ""
 
 	local start = os.clock()
 
@@ -2265,7 +2314,7 @@ function engine:go_perft(depth, expectedDebug)
 			if expectedDebug and expectedDebug[movestr] and expectedDebug[movestr] ~= num then
 				str ..= " : [SHOULD BE "..expectedDebug[movestr].."]"
 			end
-			print(str)
+			output ..= str .. "\n"
 			task.wait()
 		end
 	end
@@ -2273,7 +2322,9 @@ function engine:go_perft(depth, expectedDebug)
 
 	local elapsedTime = os.clock() - start
 
-	print(("Depth: %d  |  Leaf Nodes: %s  |  Checkmates: %d  |  Total Time: %.2fs"):format(depth, formatNumber(totalSum), self.checkmates, elapsedTime))
+	output ..= (("Depth: %d  |  Leaf Nodes: %s  |  Checkmates: %d  |  Total Time: %.2fs \n"):format(depth, formatNumber(totalSum), self.checkmates, elapsedTime))
+	
+	return totalSum, elapsedTime, output
 end
 
 
